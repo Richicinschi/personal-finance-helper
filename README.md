@@ -1,84 +1,74 @@
 # Personal Finance Helper
 
-A personal finance analytics dashboard that transforms raw transaction data from any CSV-exporting expense tracking app into actionable financial insights.
+A personal finance analytics dashboard that transforms ING Bank Netherlands CSV exports into actionable insights — running balances, category breakdowns, and spend-over-time charts.
 
 ## Architecture
 
 ```
 personal-finance-helper/
-├── etl/                  # Extract, Transform, Load pipeline
-│   ├── extract.py        # CSV/Excel loader with schema detection
-│   ├── transform.py      # Filter & standardize transactions
-│   ├── load.py           # PostgreSQL loader
-│   ├── pipeline.py       # Orchestrates ETL steps
-│   └── db.py             # SQLAlchemy engine factory
-├── queries/              # Named SQL query files
-│   ├── executor.py       # Parses named queries, returns DataFrames
-│   ├── running_balance.sql
-│   ├── daily_spend.sql
-│   ├── weekly_spend.sql
-│   ├── monthly_spend.sql
-│   └── account_pivot.sql
-├── app/                  # Streamlit frontend
-│   ├── main.py           # Entry point, tab layout
-│   ├── state.py          # Session state management
-│   ├── pages/
-│   │   ├── landing.py
-│   │   ├── data_management.py
-│   │   └── analytics.py
-│   └── components/
-│       └── sidebar.py
-├── notebooks/            # Exploratory analysis
-├── tests/                # Pytest test suite
-├── Dockerfile
+├── pipeline.py       # ETL: extract → transform → load (CSV/Excel → SQLite/PG)
+├── query_layer.py    # Named SQL queries + QueryExecutor → DataFrames
+├── app.py            # Streamlit dashboard (3 tabs + sidebar filters)
+├── explore_data.py   # Schema discovery script (run once on new data)
+├── test_etl.py       # 35 ETL tests (pytest)
+├── test_queries.py   # 39 query layer tests (pytest)
+├── Dockerfile        # python:3.11-slim image
 ├── docker-compose.yml
-└── .env.example
+├── .env.example
+└── data/             # gitignored — put bank.csv here
 ```
 
 ## Standard Transaction Schema
 
-After transformation, all transactions conform to this schema:
-
-| Column           | Type     | Description                        |
-|------------------|----------|------------------------------------|
-| transaction_type | str      | e.g. debit, credit, transfer       |
-| date             | date     | Transaction date                   |
-| description      | str      | Merchant / narrative               |
-| amount           | float    | Positive = inflow, Negative = outflow |
-| currency         | str      | ISO 4217 code (e.g. USD, EUR)      |
-| category         | str      | Spending category                  |
-| account          | str      | Account / payment method name      |
-| status           | str      | verified, pending, etc.            |
+| Column | Type | Description |
+|---|---|---|
+| `transaction_type` | str | Payment terminal, Transfer, iDEAL, etc. |
+| `date` | date | Parsed from YYYYMMDD integer |
+| `description` | str | Merchant / counterparty name |
+| `amount` | float | Positive = credit, Negative = debit |
+| `currency` | str | Always `EUR` for ING NL |
+| `category` | str | Rule-based: Groceries, Transport, Dining, … |
+| `account` | str | Account IBAN |
+| `status` | str | Always `verified` |
 
 ## Quick Start
 
-### With Docker (recommended)
+### Option A — Local (SQLite, no Docker)
 
 ```bash
-cp .env.example .env
-# edit .env with your DB credentials
-docker compose up
-```
-
-App will be available at http://localhost:8501
-
-### Local Development
-
-```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env
-# edit .env
-streamlit run app/main.py
+
+# Run the app (SQLite auto-created at finance.db)
+streamlit run app.py
 ```
+
+Upload your ING Bank CSV in the **Data Management** tab. That's it.
+
+### Option B — Docker (recommended for persistence)
+
+```bash
+cp .env.example .env          # review settings if needed
+docker compose up --build
+```
+
+Open **http://localhost:8501**. The SQLite database is stored in a named Docker volume (`finance_db`) — data persists across restarts.
+
+**Optional PostgreSQL:** uncomment the `db` service in `docker-compose.yml` and update `DATABASE_URL`.
 
 ### Run Tests
 
 ```bash
-pytest tests/
+pytest test_etl.py test_queries.py -v
+# 74 tests, all passing
+```
+
+### ETL Pipeline (CLI)
+
+```bash
+# Load a CSV directly without the UI
+python pipeline.py --file data/bank.csv --db sqlite:///finance.db
 ```
 
 ## Data Privacy
 
-**Never commit data files.** The `data/` directory and all `*.xlsx`, `*.xls`, `*.csv` files are gitignored. Your bank data stays local.
+`data/`, `*.csv`, `*.xlsx`, `*.xls`, `*.db` are all gitignored. Your bank data never leaves your machine.

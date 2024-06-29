@@ -1,0 +1,45 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # App — Streamlit dashboard
+  # Default: uses SQLite stored in the 'finance_db' volume (no Postgres needed)
+  # Switch to Postgres: uncomment the 'db' service and update DATABASE_URL
+  # ---------------------------------------------------------------------------
+  app:
+    build: .
+    ports:
+      - "${APP_PORT:-8501}:8501"
+    environment:
+      # SQLite (default — no extra service needed)
+      DATABASE_URL: sqlite:////app/db/finance.db
+      # Uncomment for PostgreSQL (also uncomment the 'db' service below):
+      # DATABASE_URL: postgresql://${POSTGRES_USER:-finance_user}:${POSTGRES_PASSWORD:-finance_pass}@db:5432/${POSTGRES_DB:-finance_db}
+    volumes:
+      - finance_db:/app/db        # persists SQLite file across restarts
+    restart: unless-stopped
+    # depends_on:                 # uncomment when using Postgres
+    #   db:
+    #     condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # DB — PostgreSQL (optional)
+  # Uncomment this service and update DATABASE_URL in 'app' to use Postgres
+  # ---------------------------------------------------------------------------
+  # db:
+  #   image: postgres:15-alpine
+  #   environment:
+  #     POSTGRES_USER: ${POSTGRES_USER:-finance_user}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-finance_pass}
+  #     POSTGRES_DB: ${POSTGRES_DB:-finance_db}
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-finance_user}"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   restart: unless-stopped
+
+volumes:
+  finance_db:
+  # postgres_data:    # uncomment when using Postgres
