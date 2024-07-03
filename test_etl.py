@@ -232,11 +232,22 @@ class TestLoad:
             assert result[0] == 5
 
     def test_append_mode(self, raw_df, processed_df, sqlite_engine):
-        load(raw_df, processed_df, sqlite_engine)
-        load(raw_df, processed_df, sqlite_engine)
+        load(raw_df, processed_df, sqlite_engine, mode="append")
+        load(raw_df, processed_df, sqlite_engine, mode="append")
         with sqlite_engine.connect() as conn:
             result = conn.execute(text("SELECT COUNT(*) FROM transactions")).fetchone()
             assert result[0] == 10
+
+    def test_replace_mode_does_not_duplicate(self, raw_df, processed_df, sqlite_engine):
+        load(raw_df, processed_df, sqlite_engine, mode="replace")
+        load(raw_df, processed_df, sqlite_engine, mode="replace")
+        with sqlite_engine.connect() as conn:
+            result = conn.execute(text("SELECT COUNT(*) FROM transactions")).fetchone()
+            assert result[0] == 5  # second replace wiped the first load
+
+    def test_invalid_mode_raises(self, raw_df, processed_df, sqlite_engine):
+        with pytest.raises(ValueError, match="mode must be"):
+            load(raw_df, processed_df, sqlite_engine, mode="upsert")
 
 
 # ---------------------------------------------------------------------------

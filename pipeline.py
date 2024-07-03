@@ -333,23 +333,37 @@ def _ensure_tables(engine: Engine) -> None:
     meta.create_all(engine)
 
 
-def load(raw: pd.DataFrame, processed: pd.DataFrame, engine: Engine) -> dict[str, int]:
+def load(
+    raw: pd.DataFrame,
+    processed: pd.DataFrame,
+    engine: Engine,
+    mode: str = "replace",
+) -> dict[str, int]:
     """Insert raw and processed DataFrames into the database.
-
-    Uses append mode — call this once per file upload. Does not deduplicate.
 
     Args:
         raw: Raw DataFrame from extract().
         processed: Standardised DataFrame from transform().
         engine: SQLAlchemy engine.
+        mode: ``"replace"`` (default) drops and recreates both tables before
+            inserting — safe for single-file uploads and re-uploads.
+            ``"append"`` adds rows to existing tables — use when loading
+            multiple CSV files in sequence via the CLI.
 
     Returns:
         Dict with 'raw_rows' and 'processed_rows' counts inserted.
     """
-    _ensure_tables(engine)
+    if mode not in ("replace", "append"):
+        raise ValueError(f"mode must be 'replace' or 'append', got '{mode}'")
 
-    raw.to_sql("raw_transactions", engine, if_exists="append", index=False)
-    processed.to_sql("transactions", engine, if_exists="append", index=False)
+    if_exists = "replace" if mode == "replace" else "append"
+
+    # _ensure_tables is only needed in append mode; replace recreates the tables.
+    if mode == "append":
+        _ensure_tables(engine)
+
+    raw.to_sql("raw_transactions", engine, if_exists=if_exists, index=False)
+    processed.to_sql("transactions", engine, if_exists=if_exists, index=False)
 
     return {
         "raw_rows": len(raw),
@@ -365,6 +379,7 @@ def run_pipeline(
     file_path: str | Path,
     engine: Engine,
     verbose: bool = True,
+    mode: str = "replace",
 ) -> dict[str, int]:
     """Run the full ETL pipeline: extract -> transform -> load.
 
@@ -372,6 +387,8 @@ def run_pipeline(
         file_path: Path to the CSV or Excel data file.
         engine: SQLAlchemy engine connected to the target database.
         verbose: Print progress messages.
+        mode: ``"replace"`` (default) clears existing data before loading.
+            ``"append"`` adds to existing data — for multi-file batch loads.
 
     Returns:
         Dict with 'raw_rows' and 'processed_rows' counts.
@@ -394,7 +411,7 @@ def run_pipeline(
 
     if verbose:
         print("[ETL] Loading into database...")
-    counts = load(raw, processed, engine)
+    counts = load(raw, processed, engine, mode=mode)
     if verbose:
         print(f"  Loaded: {counts['raw_rows']:,} raw, {counts['processed_rows']:,} processed")
         print("[ETL] Pipeline complete.")
@@ -416,11 +433,17 @@ def main() -> None:
         default="sqlite:///finance.db",
         help="SQLAlchemy database URL (default: sqlite:///finance.db)",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["replace", "append"],
+        default="replace",
+        help="'replace' clears existing data (default); 'append' adds to it",
+    )
     args = parser.parse_args()
 
     engine = make_engine(args.db)
     try:
-        counts = run_pipeline(args.file, engine, verbose=True)
+        counts = run_pipeline(args.file, engine, verbose=True, mode=args.mode)
         print(f"\nDone. Raw rows: {counts['raw_rows']:,} | Processed: {counts['processed_rows']:,}")
     except (FileNotFoundError, ValueError, KeyError) as e:
         print(f"ERROR: {e}", file=sys.stderr)

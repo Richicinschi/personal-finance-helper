@@ -216,6 +216,20 @@ def render_data_management() -> None:
 
     # ---- File upload ----
     st.subheader("Upload transaction file")
+
+    upload_mode = st.radio(
+        "Load mode",
+        options=["Replace all data", "Append to existing"],
+        index=0,
+        horizontal=True,
+        help=(
+            "**Replace** clears the database before loading — use this for a fresh import. "
+            "**Append** adds the new file on top of existing data — use when loading "
+            "multiple CSV files that cover different date ranges."
+        ),
+    )
+    mode_arg = "replace" if upload_mode == "Replace all data" else "append"
+
     uploaded = st.file_uploader(
         "Choose a CSV or Excel file exported from your bank",
         type=["csv", "xlsx", "xls"],
@@ -231,7 +245,12 @@ def render_data_management() -> None:
         with st.spinner(f"Running ETL pipeline on {uploaded.name}…"):
             try:
                 engine = make_engine(_db_url())
-                counts = run_pipeline(tmp_path, engine, verbose=False)
+                counts = run_pipeline(tmp_path, engine, verbose=False, mode=mode_arg)
+
+                # Read total rows now in DB (not just this file's rows)
+                from sqlalchemy import text as _text
+                with engine.connect() as _conn:
+                    total_in_db = _conn.execute(_text("SELECT COUNT(*) FROM transactions")).scalar()
 
                 # Refresh account list from DB
                 ex = QueryExecutor(engine)
@@ -239,14 +258,16 @@ def render_data_management() -> None:
 
                 st.session_state["engine"]       = engine
                 st.session_state["raw_count"]    = counts["raw_rows"]
-                st.session_state["proc_count"]   = counts["processed_rows"]
+                st.session_state["proc_count"]   = total_in_db
                 st.session_state["accounts"]     = acct_df["account"].tolist()
                 st.session_state["sel_accounts"] = acct_df["account"].tolist()
                 st.session_state["filename"]     = uploaded.name
 
+                action = "Replaced with" if mode_arg == "replace" else "Appended"
                 st.success(
-                    f"Loaded **{counts['processed_rows']:,}** transactions "
-                    f"({counts['raw_rows']:,} raw rows) from `{uploaded.name}`"
+                    f"{action} **{counts['processed_rows']:,}** transactions from "
+                    f"`{uploaded.name}`. "
+                    f"**Total in database: {total_in_db:,}**"
                 )
             except Exception as e:
                 st.error(f"Pipeline error: {e}")
@@ -375,10 +396,10 @@ def render_analytics() -> None:
                     orientation="h",
                     labels={"total_spent": "Total Spent (EUR)", "category": "Category"},
                     template="plotly_white",
-                    color="total_spent",
-                    color_continuous_scale="Blues",
+                    color="category",
+                    color_discrete_sequence=px.colors.qualitative.Plotly,
                 )
-                fig3.update_layout(showlegend=False, coloraxis_showscale=False)
+                fig3.update_layout(showlegend=False)
                 st.plotly_chart(fig3, use_container_width=True)
             with col_b:
                 st.dataframe(
@@ -397,16 +418,259 @@ def render_analytics() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tab 4 — Custom Explorer
+# ---------------------------------------------------------------------------
+
+# Columns available for grouping, with human-readable labels
+_GROUPBY_OPTIONS: dict[str, str] = {
+    "name_description": "Description (name_description)",
+    "counterparty":     "Counterparty IBAN",
+    "transaction_type": "Transaction Type",
+    "code":             "ING Code (BA / GT / OV …)",
+    "debit_credit":     "Debit / Credit",
+    "notifications":    "Notifications (raw text)",
+    "date_day":         "Date — Daily",
+    "date_week":        "Date — Weekly",
+    "date_month":       "Date — Monthly",
+}
+
+_METRIC_OPTIONS: dict[str, str] = {
+    "total_eur":  "Total EUR",
+    "count":      "Transaction count",
+    "avg_eur":    "Average EUR per transaction",
+}
+
+
+def _load_raw_df(engine) -> pd.DataFrame:
+    """Load raw_transactions and enrich with parsed amount and date columns."""
+    df = pd.read_sql("SELECT * FROM raw_transactions", engine)
+
+    # Parse signed amount from ING comma-decimal strings
+    amounts = (
+        df["amount_eur"].astype(str)
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+        .astype(float)
+    )
+    df["amount_signed"] = amounts.where(
+        df["debit_credit"].str.strip().str.lower() == "credit", -amounts
+    )
+
+    # Parse date columns for each granularity
+    dates = pd.to_datetime(df["date"].astype(str), format="%Y%m%d")
+    df["date_day"]   = dates.dt.strftime("%Y-%m-%d")
+    df["date_week"]  = dates.dt.strftime("%Y-%W")
+    df["date_month"] = dates.dt.strftime("%Y-%m")
+    df["date_parsed"] = dates
+
+    return df
+
+
+def render_explorer() -> None:
+    st.header("Transaction Explorer")
+    st.caption(
+        "Group and visualise any field from the raw transaction data. "
+        "All original columns are preserved — no renaming."
+    )
+
+    if not _has_data():
+        st.info("Upload data in the **Data Management** tab first.", icon="📂")
+        return
+
+    raw = _load_raw_df(_get_engine())
+
+    # ---- Controls ----
+    with st.container():
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            group_key = st.selectbox(
+                "Group by",
+                options=list(_GROUPBY_OPTIONS.keys()),
+                format_func=lambda k: _GROUPBY_OPTIONS[k],
+            )
+
+        with c2:
+            metric_key = st.selectbox(
+                "Metric",
+                options=list(_METRIC_OPTIONS.keys()),
+                format_func=lambda k: _METRIC_OPTIONS[k],
+            )
+
+        with c3:
+            direction = st.radio(
+                "Include",
+                options=["All", "Debits only", "Credits only"],
+                horizontal=True,
+            )
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            _n_unique = raw[group_key].nunique()
+            top_n = st.slider(
+                f"Show top N groups (of {_n_unique:,})",
+                min_value=1,
+                max_value=_n_unique,
+                value=min(20, _n_unique),
+                step=1,
+            )
+        with c5:
+            date_from_raw = st.date_input("Date from", value=None, key="explorer_date_from")
+        with c6:
+            date_to_raw   = st.date_input("Date to",   value=None, key="explorer_date_to")
+
+    # ---- Apply filters ----
+    df = raw.copy()
+
+    if direction == "Debits only":
+        df = df[df["amount_signed"] < 0]
+    elif direction == "Credits only":
+        df = df[df["amount_signed"] > 0]
+
+    if date_from_raw:
+        df = df[df["date_parsed"] >= pd.Timestamp(date_from_raw)]
+    if date_to_raw:
+        df = df[df["date_parsed"] <= pd.Timestamp(date_to_raw)]
+
+    if df.empty:
+        st.warning("No rows match the current filters.")
+        return
+
+    # ---- Aggregate ----
+    group_col = group_key  # the actual column name in df
+
+    grouped = (
+        df.groupby(group_col, dropna=False)
+        .agg(
+            total_eur  =("amount_signed", "sum"),
+            count      =("amount_signed", "count"),
+            avg_eur    =("amount_signed", "mean"),
+        )
+        .reset_index()
+    )
+
+    # For debits we want "money out" as positive numbers in the chart
+    if direction == "Debits only":
+        grouped["total_eur"] = grouped["total_eur"].abs()
+        grouped["avg_eur"]   = grouped["avg_eur"].abs()
+
+    metric_col = metric_key
+    grouped = grouped.sort_values(metric_col, ascending=False).head(top_n)
+
+    # ---- Chart ----
+    st.subheader(f"{_METRIC_OPTIONS[metric_key]} by {_GROUPBY_OPTIONS[group_key]}")
+
+    is_date_group = group_key.startswith("date_")
+
+    if is_date_group:
+        # Vertical bar for time-series — single neutral color, no gradient
+        grouped_sorted = grouped.sort_values(group_col)
+        fig = px.bar(
+            grouped_sorted,
+            x=group_col,
+            y=metric_col,
+            labels={group_col: "Period", metric_col: _METRIC_OPTIONS[metric_key]},
+            template="plotly_white",
+        )
+    else:
+        # Horizontal bar — distinct color per bar
+        fig = px.bar(
+            grouped,
+            x=metric_col,
+            y=group_col,
+            orientation="h",
+            labels={group_col: _GROUPBY_OPTIONS[group_key], metric_col: _METRIC_OPTIONS[metric_key]},
+            template="plotly_white",
+            color=group_col,
+            color_discrete_sequence=px.colors.qualitative.Plotly,
+        )
+        fig.update_layout(
+            yaxis={"categoryorder": "total ascending"},
+            showlegend=False,
+        )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ---- Table ----
+    st.subheader("Detail table")
+
+    display = grouped.rename(columns={
+        group_col:   _GROUPBY_OPTIONS[group_key],
+        "total_eur": "Total (EUR)",
+        "count":     "# Transactions",
+        "avg_eur":   "Avg (EUR)",
+    })
+
+    st.dataframe(
+        display.style.format({
+            "Total (EUR)": "{:.2f}",
+            "Avg (EUR)":   "{:.2f}",
+        }),
+        use_container_width=True,
+        height=min(60 + len(display) * 35, 600),
+    )
+
+    # ---- Raw drill-down ----
+    with st.expander("Raw transactions for selected group"):
+        options = grouped[group_col].tolist()
+        selected_vals = st.multiselect(
+            f"Pick one or more {_GROUPBY_OPTIONS[group_key]} values to inspect",
+            options=options,
+            default=options[:1],
+            key="drilldown_select",
+        )
+        if not selected_vals:
+            st.info("Select at least one value above to see details.")
+        else:
+            drill = df[df[group_col].isin(selected_vals)].sort_values("date_parsed", ascending=False)
+
+            # Total sum metric
+            total = drill["amount_signed"].sum()
+            st.metric("Total amount (EUR)", f"{total:+,.2f}")
+
+            # Pie chart — one slice per selected value, sized by abs sum
+            pie_data = (
+                drill.groupby(group_col)["amount_signed"]
+                .sum()
+                .reset_index()
+                .rename(columns={"amount_signed": "sum_amount"})
+            )
+            pie_data["abs_sum"] = pie_data["sum_amount"].abs()
+            pie_data["label"] = pie_data.apply(
+                lambda r: f"{r[group_col]}: {r['sum_amount']:+,.2f} EUR", axis=1
+            )
+            fig_pie = px.pie(
+                pie_data,
+                names=group_col,
+                values="abs_sum",
+                hover_name="label",
+                color_discrete_sequence=px.colors.qualitative.Plotly,
+            )
+            fig_pie.update_traces(textposition="inside", textinfo="percent+label")
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+            # Raw transactions table
+            st.write(f"**{len(drill)} transactions**")
+            st.dataframe(
+                drill.drop(columns=["date_parsed", "date_day", "date_week", "date_month",
+                                     "amount_signed"], errors="ignore"),
+                use_container_width=True,
+                height=400,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Main layout
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     render_sidebar()
 
-    tab_landing, tab_data, tab_analytics = st.tabs([
+    tab_landing, tab_data, tab_analytics, tab_explorer = st.tabs([
         "Home",
         "Data Management",
         "Analytics",
+        "Explorer",
     ])
 
     with tab_landing:
@@ -417,6 +681,9 @@ def main() -> None:
 
     with tab_analytics:
         render_analytics()
+
+    with tab_explorer:
+        render_explorer()
 
 
 main()
