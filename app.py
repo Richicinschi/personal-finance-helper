@@ -442,25 +442,48 @@ _METRIC_OPTIONS: dict[str, str] = {
 
 
 def _load_raw_df(engine) -> pd.DataFrame:
-    """Load raw_transactions and enrich with parsed amount and date columns."""
+    """Load raw_transactions and enrich with parsed amount and date columns.
+
+    Supports both ING (amount_eur + debit_credit) and Revolut (amount, pre-signed).
+    """
     df = pd.read_sql("SELECT * FROM raw_transactions", engine)
+    cols = set(df.columns)
 
-    # Parse signed amount from ING comma-decimal strings
-    amounts = (
-        df["amount_eur"].astype(str)
-        .str.replace(".", "", regex=False)
-        .str.replace(",", ".", regex=False)
-        .astype(float)
-    )
-    df["amount_signed"] = amounts.where(
-        df["debit_credit"].str.strip().str.lower() == "credit", -amounts
-    )
+    # --- Amount ---
+    if "amount_eur" in cols:
+        # ING: comma-decimal unsigned string + Debit/Credit column
+        amounts = (
+            df["amount_eur"].astype(str)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
+            .astype(float)
+        )
+        df["amount_signed"] = amounts.where(
+            df["debit_credit"].str.strip().str.lower() == "credit", -amounts
+        )
+    elif "amount" in cols:
+        # Revolut (and other formats): already a signed float
+        df["amount_signed"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    else:
+        df["amount_signed"] = 0.0
 
-    # Parse date columns for each granularity
-    dates = pd.to_datetime(df["date"].astype(str), format="%Y%m%d")
-    df["date_day"]   = dates.dt.strftime("%Y-%m-%d")
-    df["date_week"]  = dates.dt.strftime("%Y-%W")
-    df["date_month"] = dates.dt.strftime("%Y-%m")
+    # --- Date ---
+    # ING uses YYYYMMDD integers; Revolut uses ISO 8601 strings with time
+    date_col = "date" if "date" in cols else (
+        "completed_date" if "completed_date" in cols else None
+    )
+    if date_col:
+        sample = str(df[date_col].dropna().iloc[0]) if len(df) > 0 else ""
+        if "-" in sample:
+            dates = pd.to_datetime(df[date_col], format="mixed", dayfirst=False)
+        else:
+            dates = pd.to_datetime(df[date_col].astype(str), format="%Y%m%d")
+    else:
+        dates = pd.Series([pd.NaT] * len(df))
+
+    df["date_day"]    = dates.dt.strftime("%Y-%m-%d")
+    df["date_week"]   = dates.dt.strftime("%Y-%W")
+    df["date_month"]  = dates.dt.strftime("%Y-%m")
     df["date_parsed"] = dates
 
     return df
