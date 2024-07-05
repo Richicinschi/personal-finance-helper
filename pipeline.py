@@ -192,23 +192,45 @@ def extract(path: str | Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _parse_amount(series: pd.Series) -> pd.Series:
-    """Convert ING-style comma-decimal strings '1.026,39' to float 1026.39."""
-    return (
-        series.astype(str)
-        .str.replace(".", "", regex=False)   # thousands separator
-        .str.replace(",", ".", regex=False)  # decimal separator
-        .astype(float)
-    )
+    """Convert ING-style comma-decimal strings '1.026,39' or standard floats to float.
+
+    ING format: dot = thousands separator, comma = decimal  → '1.026,39' → 1026.39
+    Revolut format: standard float string                   → '-50.12'   → -50.12
+    """
+    s = series.astype(str)
+    if s.str.contains(",").any():
+        # ING: strip thousands-dot, swap decimal-comma → dot
+        return (
+            s.str.replace(".", "", regex=False)
+             .str.replace(",", ".", regex=False)
+             .astype(float)
+        )
+    # Already standard float (Revolut and similar)
+    return s.astype(float)
 
 
-def _sign_amount(df: pd.DataFrame, amount_col: str, dc_col: str) -> pd.Series:
-    """Return signed amount: Credit = positive, Debit = negative."""
+def _sign_amount(df: pd.DataFrame, amount_col: str, dc_col: Optional[str]) -> pd.Series:
+    """Return signed amount.
+
+    ING: amounts are unsigned strings; sign is determined by the Debit/Credit column.
+    Revolut: amounts are already signed floats; no Debit/Credit column needed.
+    """
     amounts = _parse_amount(df[amount_col])
-    return amounts.where(df[dc_col].str.strip().str.lower() == "credit", -amounts)
+    if dc_col is not None:
+        return amounts.where(df[dc_col].str.strip().str.lower() == "credit", -amounts)
+    return amounts  # already signed
 
 
 def _parse_date(series: pd.Series) -> pd.Series:
-    """Convert YYYYMMDD integer or string to datetime.date."""
+    """Convert dates to datetime.date.
+
+    Supports:
+    - YYYYMMDD integer or string (ING): 20240101
+    - ISO 8601 with optional time (Revolut): '2024-12-20 11:16:28' or '2024-12-20'
+    """
+    sample = str(series.dropna().iloc[0]) if len(series.dropna()) > 0 else ""
+    if "-" in sample:
+        return pd.to_datetime(series, format="mixed", dayfirst=False).dt.date
     return pd.to_datetime(series.astype(str), format="%Y%m%d").dt.date
 
 
@@ -250,10 +272,20 @@ def transform(raw: pd.DataFrame) -> pd.DataFrame:
     out["date"] = _parse_date(df[col_map["date"]])
     out["description"] = df[col_map["description"]].str.strip()
     out["amount"] = _sign_amount(df, col_map["amount_raw"], col_map["debit_credit"])
-    out["currency"] = "EUR"
+    out["currency"] = (
+        df[col_map["currency"]].str.strip() if col_map["currency"] else "EUR"
+    )
     out["category"] = out["description"].apply(_classify)
-    out["account"] = df[col_map["account"]].str.strip()
-    out["status"] = "verified"
+    out["account"] = (
+        df[col_map["account"]].str.strip()
+        if col_map["account"]
+        else raw["source_file"].str.replace(r"\.[^.]+$", "", regex=True)
+    )
+    out["status"] = (
+        df[col_map["status"]].str.strip().str.lower()
+        if col_map["status"]
+        else "verified"
+    )
 
     # Drop rows with null critical fields
     critical = ["date", "description", "amount", "account"]
@@ -266,10 +298,11 @@ def transform(raw: pd.DataFrame) -> pd.DataFrame:
     return out[STANDARD_COLUMNS]
 
 
-def _detect_column_map(columns: list[str]) -> dict[str, str]:
+def _detect_column_map(columns: list[str]) -> dict[str, Optional[str]]:
     """Map logical field names to actual snake_case column names.
 
-    Supports ING Bank export format and generic fallbacks.
+    Supports ING Bank and Revolut export formats; optional fields return None
+    when absent so callers can apply format-appropriate fallbacks.
     """
     col_set = set(columns)
 
@@ -279,16 +312,26 @@ def _detect_column_map(columns: list[str]) -> dict[str, str]:
                 return c
         raise KeyError(
             f"Could not find any of {candidates} in columns: {columns}. "
-            "Ensure the file is a valid ING Bank CSV export."
+            "Ensure the file is a valid ING Bank or Revolut CSV export."
         )
 
+    def find_optional(candidates: list[str]) -> Optional[str]:
+        for c in candidates:
+            if c in col_set:
+                return c
+        return None
+
     return {
-        "date":             find(["date"]),
+        # Required — present in both ING and Revolut
+        "date":             find(["date", "completed_date", "started_date"]),
         "description":      find(["name_description", "description", "name"]),
-        "account":          find(["account"]),
         "amount_raw":       find(["amount_eur", "amount", "bedrag_eur"]),
-        "debit_credit":     find(["debit_credit", "debit_credit_indicator", "af_bij"]),
-        "transaction_type": find(["transaction_type", "mutatiesoort"]),
+        "transaction_type": find(["transaction_type", "mutatiesoort", "type"]),
+        # Optional — ING has these, Revolut does not (or differs)
+        "account":          find_optional(["account"]),
+        "debit_credit":     find_optional(["debit_credit", "debit_credit_indicator", "af_bij"]),
+        "currency":         find_optional(["currency"]),
+        "status":           find_optional(["state"]),
     }
 
 
@@ -356,14 +399,16 @@ def load(
     if mode not in ("replace", "append"):
         raise ValueError(f"mode must be 'replace' or 'append', got '{mode}'")
 
-    if_exists = "replace" if mode == "replace" else "append"
+    processed_if_exists = "replace" if mode == "replace" else "append"
 
-    # _ensure_tables is only needed in append mode; replace recreates the tables.
+    # raw_transactions always replaces: ING and Revolut have incompatible raw schemas
+    # so mixing them in one table is not meaningful. The last-loaded file wins.
+    # _ensure_tables is only needed in append mode; replace recreates the processed table.
     if mode == "append":
         _ensure_tables(engine)
 
-    raw.to_sql("raw_transactions", engine, if_exists=if_exists, index=False)
-    processed.to_sql("transactions", engine, if_exists=if_exists, index=False)
+    raw.to_sql("raw_transactions", engine, if_exists="replace", index=False)
+    processed.to_sql("transactions", engine, if_exists=processed_if_exists, index=False)
 
     return {
         "raw_rows": len(raw),

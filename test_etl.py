@@ -39,6 +39,15 @@ ING_CSV_CONTENT = textwrap.dedent("""\
     20240105,Revolut Transfer,NL53INGB0001,NL25REVO0001,GT,Debit,"50,00",Online Banking,revolut note
 """)
 
+REVOLUT_CSV_CONTENT = textwrap.dedent("""\
+    Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance
+    Transfer,Current,2024-12-20 11:16:28,2024-12-20 11:16:28,Transfer from John Doe,500.00,0.00,EUR,COMPLETED,500.00
+    Card Payment,Current,2024-12-23 13:19:23,2024-12-24 11:13:26,Netflix,-12.99,0.00,EUR,COMPLETED,487.01
+    Card Payment,Current,2025-01-03 22:11:37,2025-01-04 13:37:40,Albert Heijn,-28.50,0.00,EUR,COMPLETED,458.51
+    Transfer,Current,2025-01-10 09:00:00,2025-01-10 09:00:00,Salary Transfer,1500.00,0.00,EUR,COMPLETED,1958.51
+    Card Payment,Current,2025-01-15 14:30:00,2025-01-16 10:00:00,NS Utrecht,-10.00,0.00,EUR,COMPLETED,1948.51
+""")
+
 # Use a local directory instead of tmp_path (avoids Windows temp permissions)
 _FIXTURE_DIR = Path(__file__).parent / ".test_fixtures"
 _FIXTURE_DIR.mkdir(exist_ok=True)
@@ -61,6 +70,25 @@ def raw_df(sample_csv: Path) -> pd.DataFrame:
 @pytest.fixture
 def processed_df(raw_df: pd.DataFrame) -> pd.DataFrame:
     return transform(raw_df)
+
+
+@pytest.fixture
+def revolut_csv() -> Path:
+    """Write a small Revolut-format CSV to a local fixture file."""
+    f = _FIXTURE_DIR / "revo.csv"
+    f.write_text(REVOLUT_CSV_CONTENT, encoding="utf-8")
+    yield f
+    f.unlink(missing_ok=True)
+
+
+@pytest.fixture
+def revolut_raw_df(revolut_csv: Path) -> pd.DataFrame:
+    return extract(revolut_csv)
+
+
+@pytest.fixture
+def revolut_processed_df(revolut_raw_df: pd.DataFrame) -> pd.DataFrame:
+    return transform(revolut_raw_df)
 
 
 @pytest.fixture
@@ -235,8 +263,12 @@ class TestLoad:
         load(raw_df, processed_df, sqlite_engine, mode="append")
         load(raw_df, processed_df, sqlite_engine, mode="append")
         with sqlite_engine.connect() as conn:
+            # processed table accumulates across appends
             result = conn.execute(text("SELECT COUNT(*) FROM transactions")).fetchone()
             assert result[0] == 10
+            # raw_transactions always replaces (schemas differ per source format)
+            result_raw = conn.execute(text("SELECT COUNT(*) FROM raw_transactions")).fetchone()
+            assert result_raw[0] == 5
 
     def test_replace_mode_does_not_duplicate(self, raw_df, processed_df, sqlite_engine):
         load(raw_df, processed_df, sqlite_engine, mode="replace")
@@ -263,3 +295,88 @@ class TestRunPipeline:
     def test_pipeline_file_not_found(self, sqlite_engine):
         with pytest.raises(FileNotFoundError):
             run_pipeline(_FIXTURE_DIR / "definitely_missing.csv", sqlite_engine, verbose=False)
+
+
+# ---------------------------------------------------------------------------
+# Revolut — Extract
+# ---------------------------------------------------------------------------
+
+class TestRevolutExtract:
+    def test_returns_dataframe(self, revolut_csv):
+        df = extract(revolut_csv)
+        import pandas as pd
+        assert isinstance(df, pd.DataFrame)
+
+    def test_row_count(self, revolut_raw_df):
+        assert len(revolut_raw_df) == 5
+
+    def test_columns_are_snake_case(self, revolut_raw_df):
+        for col in revolut_raw_df.columns:
+            assert col == col.lower()
+            assert " " not in col
+
+    def test_source_file_column(self, revolut_csv, revolut_raw_df):
+        assert "source_file" in revolut_raw_df.columns
+        assert revolut_raw_df["source_file"].iloc[0] == revolut_csv.name
+
+
+# ---------------------------------------------------------------------------
+# Revolut — Transform
+# ---------------------------------------------------------------------------
+
+class TestRevolutTransform:
+    def test_output_columns(self, revolut_processed_df):
+        assert list(revolut_processed_df.columns) == STANDARD_COLUMNS
+
+    def test_row_count(self, revolut_processed_df):
+        assert len(revolut_processed_df) == 5
+
+    def test_date_is_date_type(self, revolut_processed_df):
+        import datetime
+        assert all(isinstance(d, datetime.date) for d in revolut_processed_df["date"])
+
+    def test_credit_is_positive(self, revolut_processed_df):
+        # Row 0: Transfer from John Doe, Amount=500.00 → positive
+        assert revolut_processed_df.loc[0, "amount"] == pytest.approx(500.00)
+
+    def test_debit_is_negative(self, revolut_processed_df):
+        # Row 1: Netflix, Amount=-12.99 → negative
+        assert revolut_processed_df.loc[1, "amount"] == pytest.approx(-12.99)
+
+    def test_currency_from_column(self, revolut_processed_df):
+        assert (revolut_processed_df["currency"] == "EUR").all()
+
+    def test_account_is_filename_without_extension(self, revolut_processed_df):
+        # No account column in Revolut → falls back to source filename stem
+        assert (revolut_processed_df["account"] == "revo").all()
+
+    def test_status_from_state_column(self, revolut_processed_df):
+        assert (revolut_processed_df["status"] == "completed").all()
+
+    def test_category_assigned(self, revolut_processed_df):
+        # Row 1: Netflix → Subscriptions
+        assert revolut_processed_df.loc[1, "category"] == "Subscriptions"
+        # Row 2: Albert Heijn → Groceries
+        assert revolut_processed_df.loc[2, "category"] == "Groceries"
+
+    def test_transaction_type_from_type_column(self, revolut_processed_df):
+        assert revolut_processed_df.loc[0, "transaction_type"] == "Transfer"
+        assert revolut_processed_df.loc[1, "transaction_type"] == "Card Payment"
+
+
+# ---------------------------------------------------------------------------
+# Revolut — Pipeline integration
+# ---------------------------------------------------------------------------
+
+class TestRevolutPipeline:
+    def test_full_pipeline(self, revolut_csv, sqlite_engine):
+        counts = run_pipeline(revolut_csv, sqlite_engine, verbose=False)
+        assert counts["raw_rows"] == 5
+        assert counts["processed_rows"] == 5
+
+    def test_mixed_load_ing_then_revolut(self, sample_csv, revolut_csv, sqlite_engine):
+        run_pipeline(sample_csv, sqlite_engine, verbose=False, mode="replace")
+        run_pipeline(revolut_csv, sqlite_engine, verbose=False, mode="append")
+        with sqlite_engine.connect() as conn:
+            result = conn.execute(text("SELECT COUNT(*) FROM transactions")).fetchone()
+            assert result[0] == 10
