@@ -236,6 +236,8 @@ def _parse_date(series: pd.Series) -> pd.Series:
 
 def _classify(description: str) -> str:
     """Apply keyword rules to assign a spending category."""
+    if not isinstance(description, str):
+        return "Other"
     lower = description.lower()
     for keyword, category in CATEGORY_RULES:
         if keyword in lower:
