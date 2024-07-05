@@ -421,18 +421,51 @@ def render_analytics() -> None:
 # Tab 4 — Custom Explorer
 # ---------------------------------------------------------------------------
 
-# Columns available for grouping, with human-readable labels
-_GROUPBY_OPTIONS: dict[str, str] = {
-    "name_description": "Description (name_description)",
+# Human-readable labels for known raw column names (both ING and Revolut)
+_COLUMN_LABELS: dict[str, str] = {
+    # ING
+    "name_description": "Description",
     "counterparty":     "Counterparty IBAN",
     "transaction_type": "Transaction Type",
     "code":             "ING Code (BA / GT / OV …)",
     "debit_credit":     "Debit / Credit",
-    "notifications":    "Notifications (raw text)",
+    "notifications":    "Notifications",
+    # Revolut
+    "description":      "Description",
+    "type":             "Transaction Type",
+    "state":            "State",
+    "product":          "Product",
+    "currency":         "Currency",
+    # Date buckets (added by _load_raw_df)
     "date_day":         "Date — Daily",
     "date_week":        "Date — Weekly",
     "date_month":       "Date — Monthly",
 }
+
+# Columns that are never useful for grouping
+_GROUPBY_EXCLUDE = {
+    "id", "source_file", "date", "started_date", "completed_date",
+    "amount_eur", "amount", "fee", "balance",
+    "amount_signed", "date_parsed",
+}
+
+
+def _build_groupby_options(df: pd.DataFrame) -> dict[str, str]:
+    """Return groupby options from the columns actually present in df."""
+    date_cols = {"date_day": "Date — Daily", "date_week": "Date — Weekly", "date_month": "Date — Monthly"}
+    options = {}
+    for col in df.columns:
+        if col in _GROUPBY_EXCLUDE:
+            continue
+        if col in date_cols:
+            continue  # added below in fixed order
+        label = _COLUMN_LABELS.get(col, col.replace("_", " ").title())
+        options[col] = label
+    # Always append date buckets at the end in consistent order
+    for col, label in date_cols.items():
+        if col in df.columns:
+            options[col] = label
+    return options
 
 _METRIC_OPTIONS: dict[str, str] = {
     "total_eur":  "Total EUR",
@@ -501,6 +534,7 @@ def render_explorer() -> None:
         return
 
     raw = _load_raw_df(_get_engine())
+    groupby_options = _build_groupby_options(raw)
 
     # ---- Controls ----
     with st.container():
@@ -509,8 +543,8 @@ def render_explorer() -> None:
         with c1:
             group_key = st.selectbox(
                 "Group by",
-                options=list(_GROUPBY_OPTIONS.keys()),
-                format_func=lambda k: _GROUPBY_OPTIONS[k],
+                options=list(groupby_options.keys()),
+                format_func=lambda k: groupby_options[k],
             )
 
         with c2:
@@ -581,7 +615,7 @@ def render_explorer() -> None:
     grouped = grouped.sort_values(metric_col, ascending=False).head(top_n)
 
     # ---- Chart ----
-    st.subheader(f"{_METRIC_OPTIONS[metric_key]} by {_GROUPBY_OPTIONS[group_key]}")
+    st.subheader(f"{_METRIC_OPTIONS[metric_key]} by {groupby_options[group_key]}")
 
     is_date_group = group_key.startswith("date_")
 
@@ -602,7 +636,7 @@ def render_explorer() -> None:
             x=metric_col,
             y=group_col,
             orientation="h",
-            labels={group_col: _GROUPBY_OPTIONS[group_key], metric_col: _METRIC_OPTIONS[metric_key]},
+            labels={group_col: groupby_options[group_key], metric_col: _METRIC_OPTIONS[metric_key]},
             template="plotly_white",
             color=group_col,
             color_discrete_sequence=px.colors.qualitative.Plotly,
@@ -618,7 +652,7 @@ def render_explorer() -> None:
     st.subheader("Detail table")
 
     display = grouped.rename(columns={
-        group_col:   _GROUPBY_OPTIONS[group_key],
+        group_col:   groupby_options[group_key],
         "total_eur": "Total (EUR)",
         "count":     "# Transactions",
         "avg_eur":   "Avg (EUR)",
@@ -637,7 +671,7 @@ def render_explorer() -> None:
     with st.expander("Raw transactions for selected group"):
         options = grouped[group_col].tolist()
         selected_vals = st.multiselect(
-            f"Pick one or more {_GROUPBY_OPTIONS[group_key]} values to inspect",
+            f"Pick one or more {groupby_options[group_key]} values to inspect",
             options=options,
             default=options[:1],
             key="drilldown_select",
